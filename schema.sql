@@ -1,8 +1,10 @@
 DROP TABLE IF EXISTS ac_daily_counts;
 
 CREATE TABLE ac_daily_counts (
-  date TEXT PRIMARY KEY,
-  count INTEGER NOT NULL DEFAULT 0
+  date TEXT NOT NULL,
+  list_id INTEGER NOT NULL DEFAULT 0,
+  count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (date, list_id)
 );
 
 DROP TABLE IF EXISTS postbacks;

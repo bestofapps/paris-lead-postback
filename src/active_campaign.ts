@@ -2,7 +2,7 @@
  * Active Campaign Email Collection Module
  *
  * Sends contacts to Active Campaign when:
- * - t5 = 'iq'
+ * - t5 matches a configured list (e.g. 'iq', 'security')
  * - The IP address resolves to US
  * - The random sample rate is met (default 100%)
  */
@@ -12,37 +12,42 @@ import { getCountryByIp, isUSCountry } from "./ip_country";
 // ── Configuration ──────────────────────────────────────────────────
 const ACTIVE_CAMPAIGN_URL = "https://cliqdigital77287.api-us1.com";
 
-const LIST_ID = 9;
+interface ListConfig {
+  listId: number;
+  dailyCap: number;
+  sendPercentage: number;
+}
 
-// Maximum contacts to send to Active Campaign per day.
-const DAILY_CAP = 100;
-
-// Percentage of qualifying leads to send (0–100). Change this to throttle.
-const SEND_PERCENTAGE = 100;
+// Map t5 values to their Active Campaign list configuration.
+// To add a new list, simply add an entry here.
+const LIST_CONFIG: Record<string, ListConfig> = {
+  iq: { listId: 9, dailyCap: 100, sendPercentage: 100 },
+  security: { listId: 5, dailyCap: 100, sendPercentage: 100 },
+};
 
 // ── Helpers ────────────────────────────────────────────────────────
 
-function shouldSend(): boolean {
-  if (SEND_PERCENTAGE >= 100) return true;
-  if (SEND_PERCENTAGE <= 0) return false;
-  return Math.random() * 100 < SEND_PERCENTAGE;
+function shouldSend(sendPercentage: number): boolean {
+  if (sendPercentage >= 100) return true;
+  if (sendPercentage <= 0) return false;
+  return Math.random() * 100 < sendPercentage;
 }
 
 function getTodayUTC(): string {
   return new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
 }
 
-async function getDailyCount(db: D1Database): Promise<number> {
+async function getDailyCount(db: D1Database, listId: number): Promise<number> {
   const today = getTodayUTC();
-  const row = await db.prepare("SELECT count FROM ac_daily_counts WHERE date = ?").bind(today).first<{ count: number }>();
+  const row = await db.prepare("SELECT count FROM ac_daily_counts WHERE date = ? AND list_id = ?").bind(today, listId).first<{ count: number }>();
   return row?.count ?? 0;
 }
 
-async function incrementDailyCount(db: D1Database): Promise<void> {
+async function incrementDailyCount(db: D1Database, listId: number): Promise<void> {
   const today = getTodayUTC();
   await db.prepare(
-    "INSERT INTO ac_daily_counts (date, count) VALUES (?, 1) ON CONFLICT(date) DO UPDATE SET count = count + 1"
-  ).bind(today).run();
+    "INSERT INTO ac_daily_counts (date, list_id, count) VALUES (?, ?, 1) ON CONFLICT(date, list_id) DO UPDATE SET count = count + 1"
+  ).bind(today, listId).run();
 }
 
 async function syncContact(apiKey: string, email: string, firstName?: string, lastName?: string): Promise<number | null> {
@@ -111,10 +116,13 @@ export async function processActiveCampaign(
   apiKey: string,
   db: D1Database
 ): Promise<ActiveCampaignResult> {
-  // 1. Check t5 === 'iq'
-  if (params.t5?.toLowerCase() !== "iq") {
-    return { sent: false, reason: "t5 is not iq" };
+  // 1. Check t5 matches a configured list
+  const t5 = params.t5?.toLowerCase();
+  if (!t5 || !(t5 in LIST_CONFIG)) {
+    return { sent: false, reason: `t5 "${t5 ?? ""}" has no configured list` };
   }
+
+  const config = LIST_CONFIG[t5];
 
   // 2. Check email exists
   if (!params.email) {
@@ -132,14 +140,14 @@ export async function processActiveCampaign(
   }
 
   // 4. Sampling
-  if (!shouldSend()) {
+  if (!shouldSend(config.sendPercentage)) {
     return { sent: false, reason: "skipped by sampling" };
   }
 
   // 5. Daily cap check
-  const dailyCount = await getDailyCount(db);
-  if (dailyCount >= DAILY_CAP) {
-    return { sent: false, reason: `daily cap reached (${dailyCount}/${DAILY_CAP})` };
+  const dailyCount = await getDailyCount(db, config.listId);
+  if (dailyCount >= config.dailyCap) {
+    return { sent: false, reason: `daily cap reached for list ${config.listId} (${dailyCount}/${config.dailyCap})` };
   }
 
   // 6. Sync contact to Active Campaign
@@ -149,14 +157,14 @@ export async function processActiveCampaign(
   }
 
   // 7. Add to list
-  const added = await addContactToList(apiKey, contactId, LIST_ID);
+  const added = await addContactToList(apiKey, contactId, config.listId);
   if (!added) {
     return { sent: false, reason: "failed to add contact to list" };
   }
 
   // 8. Increment daily counter
-  await incrementDailyCount(db);
+  await incrementDailyCount(db, config.listId);
 
-  console.log(`ActiveCampaign: synced contact ${contactId} (${params.email}) to list ${LIST_ID} (${dailyCount + 1}/${DAILY_CAP} today)`);
+  console.log(`ActiveCampaign: synced contact ${contactId} (${params.email}) to list ${config.listId} [t5=${t5}] (${dailyCount + 1}/${config.dailyCap} today)`);
   return { sent: true, contactId };
 }
